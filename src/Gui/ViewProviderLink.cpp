@@ -50,6 +50,7 @@
 #include <Inventor/nodes/SoTransform.h>
 #include <Inventor/sensors/SoNodeSensor.h>
 #include <QApplication>
+#include <QDir>
 #include <QPixmapCache>
 #include <QThread>
 #include <QMenu>
@@ -2064,7 +2065,8 @@ namespace
 // and when a document is deleted, so the file system is consulted at most once
 // per overlay kind and document per recompute pass. A read-only change made on
 // disk between recomputes is therefore noticed by the next recompute (or save),
-// not by an intermediate property edit.
+// not by an intermediate property edit. A change of the icon search paths clears
+// the memo at once.
 class LinkOverlayMemo
 {
 public:
@@ -2089,10 +2091,12 @@ public:
         connected = true;
         auto& app = App::GetApplication();
         // Plain connections owned by App::Application's signals; never disconnected.
-        app.signalBeforeRecomputeDocument.connect([](const App::Document&) { instance().invalidate(); });
-        app.signalFinishSaveDocument.connect(
-            [](const App::Document&, const std::string&) { instance().invalidate(); }
-        );
+        app.signalBeforeRecomputeDocument.connect([](const App::Document&) {
+            instance().invalidate();
+        });
+        app.signalFinishSaveDocument.connect([](const App::Document&, const std::string&) {
+            instance().invalidate();
+        });
         app.signalDeleteDocument.connect([](const App::Document&) { instance().invalidate(); });
     }
 
@@ -2141,10 +2145,14 @@ private:
     void sync()
     {
         const quint64 now = generation.load(std::memory_order_relaxed);
-        if (now == seen) {
+        // The overlay SVG is resolved through the "icons" search paths, which can change
+        // at run time (e.g. FreeCADGui.addIconPath); a change must not leave old pixmaps.
+        QStringList paths = QDir::searchPaths(QStringLiteral("icons"));
+        if (now == seen && paths == iconPaths) {
             return;
         }
         seen = now;
+        iconPaths = std::move(paths);
         readOnly.clear();
         for (const auto& key : keys) {
             QPixmapCache::remove(key);
@@ -2155,6 +2163,7 @@ private:
     bool connected = false;
     std::atomic<quint64> generation {1};
     quint64 seen = 1;
+    QStringList iconPaths;
     std::unordered_map<const App::Document*, std::pair<std::string, bool>> readOnly;
     std::vector<QString> keys;
 };
