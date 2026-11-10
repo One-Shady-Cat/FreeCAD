@@ -50,12 +50,15 @@
 #include <Inventor/nodes/SoTransform.h>
 #include <Inventor/sensors/SoNodeSensor.h>
 #include <QApplication>
+#include <QPixmapCache>
+#include <QThread>
 #include <QMenu>
 #include <QCheckBox>
 
 
 #include <boost/range.hpp>
 #include <App/ElementNamingUtils.h>
+#include <App/Application.h>
 #include <App/Document.h>
 #include <App/SuppressibleExtension.h>
 #include <Base/BoundBoxPy.h>
@@ -2050,25 +2053,138 @@ QIcon ViewProviderLink::getIcon() const
     return Gui::BitmapFactory().pixmap(sPixmap);
 }
 
+namespace
+{
+// GUI-thread-only memo for the inputs of a link's tree-icon overlay.
+//
+// Every link refresh used to resolve the overlay SVG through the icon search
+// paths and stat the linked document's file (Document::isReadOnlyFile), once per
+// link per update. Both answers are now reused until the memo generation
+// advances. It advances when any document starts a recompute, after any save,
+// and when a document is deleted, so the file system is consulted at most once
+// per overlay kind and document per recompute pass. A read-only change made on
+// disk between recomputes is therefore noticed by the next recompute (or save),
+// not by an intermediate property edit.
+class LinkOverlayMemo
+{
+public:
+    static LinkOverlayMemo& instance()
+    {
+        // Intentionally leaked: the signal slots below may outlive static destruction.
+        static auto* memo = new LinkOverlayMemo;
+        return *memo;
+    }
+
+    static bool usable()
+    {
+        auto app = QCoreApplication::instance();
+        return app && !QCoreApplication::closingDown() && QThread::currentThread() == app->thread();
+    }
+
+    void connectOnce()
+    {
+        if (connected) {
+            return;
+        }
+        connected = true;
+        auto& app = App::GetApplication();
+        // Plain connections owned by App::Application's signals; never disconnected.
+        app.signalBeforeRecomputeDocument.connect([](const App::Document&) { instance().invalidate(); });
+        app.signalFinishSaveDocument.connect(
+            [](const App::Document&, const std::string&) { instance().invalidate(); }
+        );
+        app.signalDeleteDocument.connect([](const App::Document&) { instance().invalidate(); });
+    }
+
+    bool isReadOnly(const App::Document* doc)
+    {
+        sync();
+        const std::string file = doc->FileName.getValue();
+        auto it = readOnly.find(doc);
+        if (it != readOnly.end() && it->second.first == file) {
+            return it->second.second;
+        }
+        const bool value = doc->isReadOnlyFile();
+        readOnly[doc] = std::make_pair(file, value);
+        return value;
+    }
+
+    QPixmap overlay(const char* name, int px)
+    {
+        sync();
+        const qreal dpr = BitmapFactoryInst::getMaximumDPR();
+        const QString key = QStringLiteral("Gui::ViewProviderLink/overlay/%1/%2/%3/%4")
+                                .arg(QLatin1String(name))
+                                .arg(px)
+                                .arg(dpr)
+                                .arg(seen);
+        QPixmap result;
+        if (QPixmapCache::find(key, &result)) {
+            return result;
+        }
+        result = BitmapFactory().pixmapFromSvg(name, QSizeF(px, px));
+        if (!result.isNull() && QPixmapCache::insert(key, result)
+            && std::find(keys.begin(), keys.end(), key) == keys.end()) {
+            keys.push_back(key);
+        }
+        return result;
+    }
+
+private:
+    // Signal handlers only advance the generation, so they are safe from any thread.
+    // Owned state is touched by the GUI thread alone, in sync().
+    void invalidate()
+    {
+        generation.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void sync()
+    {
+        const quint64 now = generation.load(std::memory_order_relaxed);
+        if (now == seen) {
+            return;
+        }
+        seen = now;
+        readOnly.clear();
+        for (const auto& key : keys) {
+            QPixmapCache::remove(key);
+        }
+        keys.clear();
+    }
+
+    bool connected = false;
+    std::atomic<quint64> generation {1};
+    quint64 seen = 1;
+    std::unordered_map<const App::Document*, std::pair<std::string, bool>> readOnly;
+    std::vector<QString> keys;
+};
+}  // namespace
+
 QPixmap ViewProviderLink::getOverlayPixmap() const
 {
     auto ext = getLinkExtension();
     constexpr int px = 12;
+    const bool memoize = LinkOverlayMemo::usable();
+    auto& memo = LinkOverlayMemo::instance();
+    if (memoize) {
+        memo.connectOnce();
+    }
+    auto load = [&](const char* name) {
+        return memoize ? memo.overlay(name, px) : BitmapFactory().pixmapFromSvg(name, QSizeF(px, px));
+    };
     if (ext && ext->getLinkedObjectProperty() && ext->_getElementCountValue()) {
-        return BitmapFactory().pixmapFromSvg("LinkArrayOverlay", QSizeF(px, px));
+        return load("LinkArrayOverlay");
     }
     else if (hasSubElement) {
-        return BitmapFactory().pixmapFromSvg("LinkSubElement", QSizeF(px, px));
+        return load("LinkSubElement");
     }
     else if (hasSubName) {
-        return BitmapFactory().pixmapFromSvg("LinkSubOverlay", QSizeF(px, px));
+        return load("LinkSubOverlay");
     }
     else {
-        return BitmapFactory().pixmapFromSvg(
-            getObject()->getLinkedObject()->getDocument()->isReadOnlyFile() ? "LinkOverlayReadOnly"
-                                                                            : "LinkOverlay",
-            QSizeF(px, px)
-        );
+        const App::Document* doc = getObject()->getLinkedObject()->getDocument();
+        const bool readOnly = memoize ? memo.isReadOnly(doc) : doc->isReadOnlyFile();
+        return load(readOnly ? "LinkOverlayReadOnly" : "LinkOverlay");
     }
 }
 
